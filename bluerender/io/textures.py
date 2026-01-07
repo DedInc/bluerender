@@ -1,40 +1,109 @@
 """
-Texture loading and management.
+Texture loading and management with optimized caching.
+
+Implements disk-based texture caching using compressed numpy arrays
+for fast subsequent loads. Textures are decoded once, quantized for
+better compression (using pngquant's imagequant algorithm), and cached.
+This avoids expensive base64+PNG decoding on repeat runs.
 """
 
-import base64
-import io
 import logging
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
-from PIL import Image
 
 from bluerender.core import TextureInfo, TextureAtlas
+from .cache import TextureCache
+from .decoder import ImageDecoder
 
 
 class TextureLoader:
-    """Loads and decodes textures from BlueMap texture data."""
+    """
+    Loads and decodes textures from BlueMap texture data.
 
-    BASE64_PREFIX = "data:image/png;base64,"
+    Uses disk caching for fast subsequent loads. Textures are decoded
+    from base64 PNG once and cached as compressed numpy arrays.
+    """
 
-    def load_atlas(self, textures_data: list) -> TextureAtlas:
+    def __init__(self, cache_dir: Optional[Path] = None):
+        self._cache = TextureCache(cache_dir)
+        self._decoder = ImageDecoder()
+
+    def load_atlas_cached_only(self, map_id: str) -> Optional[TextureAtlas]:
+        """
+        Try to load texture atlas from cache only (no network).
+
+        Args:
+            map_id: Map identifier
+
+        Returns:
+            TextureAtlas if cache exists, None otherwise
+        """
+        cached = self._cache.load_cached_direct(map_id)
+        if cached is not None:
+            return self._build_atlas_from_cache(cached[0], cached[1])
+        return None
+
+    def load_atlas(self, textures_data: list, map_id: str = "default") -> TextureAtlas:
         """
         Load texture atlas from textures.json data.
 
+        Uses disk cache for fast loading on subsequent runs.
+
         Args:
             textures_data: List of texture definitions from textures.json
+            map_id: Map identifier for cache keying
 
         Returns:
             TextureAtlas containing all loaded textures
         """
+        cached = self._cache.load_cached(map_id, textures_data)
+        if cached is not None:
+            return self._build_atlas_from_cache(cached[0], cached[1])
+
+        logging.info("Decoding textures (first run, will be cached)...")
+        atlas, images, texture_info = self._decode_textures(textures_data)
+
+        self._cache.save_to_cache(map_id, textures_data, images, texture_info)
+        logging.info(f"Loaded {len(atlas)} textures")
+        return atlas
+
+    def _decode_textures(self, textures_data: list) -> tuple:
+        """Decode all textures from base64 PNG data."""
         atlas = TextureAtlas()
+        images = []
+        texture_info = []
 
         for tex_data in textures_data:
             tex_info = self._parse_texture_entry(tex_data)
             atlas.textures.append(tex_info)
+            images.append(tex_info.image)
+            texture_info.append(
+                {
+                    "resource_path": tex_info.resource_path,
+                    "color": list(tex_info.color),
+                    "half_transparent": tex_info.half_transparent,
+                }
+            )
 
-        logging.info(f"Loaded {len(atlas)} textures")
+        return atlas, images, texture_info
+
+    def _build_atlas_from_cache(
+        self, images: List[Optional[np.ndarray]], texture_info: List[dict]
+    ) -> TextureAtlas:
+        """Build atlas from cached data."""
+        atlas = TextureAtlas()
+
+        for i, info in enumerate(texture_info):
+            tex = TextureInfo(
+                resource_path=info["resource_path"],
+                color=tuple(info["color"]),
+                half_transparent=info["half_transparent"],
+                image=images[i] if i < len(images) else None,
+            )
+            atlas.textures.append(tex)
+
         return atlas
 
     def _parse_texture_entry(self, tex_data: dict) -> TextureInfo:
@@ -46,22 +115,6 @@ class TextureLoader:
         )
 
         texture_str = tex_data.get("texture", "")
-        tex_info.image = self._decode_base64_image(texture_str, tex_info.resource_path)
+        tex_info.image = self._decoder.decode(texture_str, tex_info.resource_path)
 
         return tex_info
-
-    def _decode_base64_image(
-        self, texture_str: str, resource_path: str
-    ) -> Optional[np.ndarray]:
-        """Decode base64 encoded PNG image."""
-        if not texture_str.startswith(self.BASE64_PREFIX):
-            return None
-
-        try:
-            b64_data = texture_str[len(self.BASE64_PREFIX) :]
-            img_bytes = base64.b64decode(b64_data)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-            return np.array(img)
-        except Exception as e:
-            logging.debug(f"Failed to decode texture {resource_path}: {e}")
-            return None

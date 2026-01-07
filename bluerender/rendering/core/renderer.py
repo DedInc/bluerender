@@ -6,22 +6,19 @@ Provides a simple API for capturing 3D views.
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import numpy as np
 from PIL import Image
 
-from bluerender.core import RenderDefaults
-from bluerender.core import (
-    TileGeometry,
-    CameraConfig,
-    RenderSettings,
-    TextureAtlas,
-)
+from bluerender.core import RenderDefaults, TileGeometry, RenderSettings, TextureAtlas
 from bluerender.io import BlueMapClient
-from .gpu_renderer import GPURenderer, MODERNGL_AVAILABLE
-from .software_renderer import SoftwareRenderer
+from ..renderers.gpu_renderer import GPURenderer, MODERNGL_AVAILABLE
+from ..renderers.software_renderer import SoftwareRenderer
+from ..renderers.fast_software_renderer import FastSoftwareRenderer, NUMBA_AVAILABLE
+from .tile_loader import TileLoader
+from ..utils.camera_utils import create_camera_from_target, calculate_scene_center
 
 
 class BlueMap3DRenderer:
@@ -32,20 +29,18 @@ class BlueMap3DRenderer:
     """
 
     def __init__(self, base_url: str, use_gpu: bool = True):
-        """
-        Initialize the renderer.
-
-        Args:
-            base_url: BlueMap server URL
-            use_gpu: Use GPU rendering if available
-        """
+        """Initialize the renderer."""
         self._client = BlueMapClient(base_url)
+        self._tile_loader = TileLoader(self._client)
         self._gpu_renderer = GPURenderer()
         self._software_renderer = SoftwareRenderer()
+        self._fast_software_renderer = FastSoftwareRenderer()
 
         self.use_gpu = use_gpu and MODERNGL_AVAILABLE
         if self.use_gpu:
             self.use_gpu = self._gpu_renderer.initialize()
+
+        self.timing: dict = {}
 
     @property
     def maps(self):
@@ -70,37 +65,23 @@ class BlueMap3DRenderer:
         output_path: Optional[str] = None,
         void_color: Tuple[int, int, int] = RenderDefaults.VOID_COLOR,
     ) -> Image.Image:
-        """
-        Capture a 3D view of the BlueMap.
+        """Capture a 3D view of the BlueMap."""
+        self.timing = {}
 
-        Args:
-            map_id: Map to render (e.g., 'world')
-            center_x, center_z: World coordinates to center on
-            radius: Number of tiles to load in each direction
-            width, height: Output image size
-            camera_distance: Distance from camera to center
-            camera_angle: Vertical angle (0=top-down, 90=horizontal)
-            camera_rotation: Horizontal rotation (0=north)
-            fov: Field of view in degrees
-            sunlight_strength: Sun light intensity (0-1)
-            ambient_light: Ambient light intensity (0-1)
-            perspective: True for perspective, False for orthographic
-            output_path: Optional path to save image
-            void_color: Background color RGB
-
-        Returns:
-            Rendered PIL Image
-        """
-        # Load tiles
-        geometries = self._load_tiles(map_id, center_x, center_z, radius)
+        t0 = time.perf_counter()
+        geometries = self._tile_loader.load_tiles_around_center(
+            map_id, center_x, center_z, radius
+        )
+        self.timing["tiles"] = time.perf_counter() - t0
 
         if not geometries:
             return self._create_empty_image(width, height, void_color, output_path)
 
-        # Load textures
+        t0 = time.perf_counter()
         texture_atlas = self._client.get_textures(map_id)
+        self.timing["textures"] = time.perf_counter() - t0
 
-        # Configure camera
+        t0 = time.perf_counter()
         camera = self._create_camera(
             geometries,
             center_x,
@@ -112,7 +93,6 @@ class BlueMap3DRenderer:
             perspective,
         )
 
-        # Configure render settings
         settings = RenderSettings(
             width=width,
             height=height,
@@ -120,56 +100,18 @@ class BlueMap3DRenderer:
             ambient_light=ambient_light,
             void_color=void_color,
         )
+        self.timing["setup"] = time.perf_counter() - t0
 
-        # Render
+        t0 = time.perf_counter()
         image = self._render(geometries, camera, settings, texture_atlas)
+        self.timing["render"] = time.perf_counter() - t0
 
-        # Save if requested
+        t0 = time.perf_counter()
         if output_path:
             self._save_image(image, output_path)
+        self.timing["save"] = time.perf_counter() - t0
 
         return image
-
-    def _load_tiles(
-        self,
-        map_id: str,
-        center_x: float,
-        center_z: float,
-        radius: int,
-    ) -> List[TileGeometry]:
-        """Load tiles around center point."""
-        tile_size, translate = self._client.get_tile_config(map_id)
-
-        tile_x = int((center_x - translate[0]) / tile_size[0])
-        tile_z = int((center_z - translate[1]) / tile_size[1])
-
-        logging.info(f"Center ({center_x}, {center_z}) -> tile ({tile_x}, {tile_z})")
-        logging.info(f"Loading tiles in radius {radius}...")
-
-        geometries = []
-        for dx in range(-radius, radius + 1):
-            for dz in range(-radius, radius + 1):
-                tx, tz = tile_x + dx, tile_z + dz
-                geom = self._client.fetch_tile(map_id, tx, tz)
-
-                if geom is not None:
-                    offset_x = tx * tile_size[0] + translate[0]
-                    offset_z = tz * tile_size[1] + translate[1]
-
-                    geometries.append(
-                        TileGeometry(
-                            geometry=geom,
-                            offset_x=offset_x,
-                            offset_z=offset_z,
-                        )
-                    )
-
-                    logging.debug(
-                        f"Loaded tile ({tx}, {tz}): {geom.num_triangles} triangles"
-                    )
-
-        logging.info(f"Loaded {len(geometries)} tiles")
-        return geometries
 
     def _create_camera(
         self,
@@ -181,14 +123,11 @@ class BlueMap3DRenderer:
         rotation: float,
         fov: float,
         perspective: bool,
-    ) -> CameraConfig:
+    ):
         """Create camera configuration."""
-        # Calculate average Y from geometry
-        avg_y = np.mean([g.geometry.position[:, 1].mean() for g in geometries])
+        target = calculate_scene_center(geometries, center_x, center_z)
 
-        target = np.array([center_x, avg_y, center_z], dtype=np.float32)
-
-        camera = CameraConfig.from_spherical(
+        camera = create_camera_from_target(
             target=target,
             distance=distance,
             angle=angle,
@@ -198,13 +137,12 @@ class BlueMap3DRenderer:
         )
 
         logging.info(f"Camera: pos={camera.position}, target={camera.target}")
-
         return camera
 
     def _render(
         self,
         geometries: List[TileGeometry],
-        camera: CameraConfig,
+        camera,
         settings: RenderSettings,
         texture_atlas: TextureAtlas,
     ) -> Image.Image:
@@ -213,9 +151,14 @@ class BlueMap3DRenderer:
             return self._gpu_renderer.render(
                 geometries, camera, settings, texture_atlas
             )
+
+        if NUMBA_AVAILABLE:
+            logging.info("Using fast CPU rendering (Numba JIT)...")
         else:
             logging.info("Using software rendering (this may be slow)...")
-            return self._software_renderer.render(geometries, camera, settings)
+        return self._fast_software_renderer.render(
+            geometries, camera, settings, texture_atlas
+        )
 
     def _create_empty_image(
         self,
@@ -232,7 +175,13 @@ class BlueMap3DRenderer:
         return img
 
     def _save_image(self, image: Image.Image, path: str) -> None:
-        """Save image and log result."""
-        image.save(path)
+        """Save image with optimized settings."""
+        path_lower = path.lower()
+        if path_lower.endswith(".png"):
+            image.save(path, compress_level=1)
+        elif path_lower.endswith(".jpg") or path_lower.endswith(".jpeg"):
+            image.save(path, quality=90, optimize=False)
+        else:
+            image.save(path)
         size_kb = Path(path).stat().st_size / 1024
         logging.info(f"Saved: {path} ({size_kb:.1f} KB)")

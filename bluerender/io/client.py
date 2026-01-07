@@ -4,7 +4,8 @@ BlueMap HTTP client for fetching tiles and settings.
 
 import gzip
 import logging
-from typing import Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -23,6 +24,7 @@ class BlueMapClient:
         self._texture_loader = TextureLoader()
         self._texture_cache: Dict[str, TextureAtlas] = {}
         self._maps: Dict[str, dict] = {}
+        self._map_settings_cache: Dict[str, dict] = {}
 
         self._load_server_settings()
 
@@ -53,7 +55,7 @@ class BlueMapClient:
 
     def get_map_settings(self, map_id: str) -> dict:
         """
-        Load map-specific settings.
+        Load map-specific settings (cached).
 
         Args:
             map_id: The map identifier
@@ -61,11 +63,16 @@ class BlueMapClient:
         Returns:
             Map settings dictionary
         """
+        if map_id in self._map_settings_cache:
+            return self._map_settings_cache[map_id]
+
         try:
             url = self.base_url + Endpoints.MAP_SETTINGS.format(map_id=map_id)
             r = self.session.get(url)
             r.raise_for_status()
-            return r.json()
+            settings = r.json()
+            self._map_settings_cache[map_id] = settings
+            return settings
         except Exception as e:
             logging.warning(f"Could not load map settings: {e}")
             return {}
@@ -114,9 +121,45 @@ class BlueMapClient:
             logging.debug(f"Tile {tile_x},{tile_z} failed: {e}")
             return None
 
+    def fetch_tiles_parallel(
+        self,
+        map_id: str,
+        tile_coords: List[Tuple[int, int]],
+        max_workers: int = 8,
+    ) -> List[Tuple[int, int, Optional[PRBMGeometry]]]:
+        """
+        Fetch multiple tiles in parallel.
+
+        Args:
+            map_id: Map identifier
+            tile_coords: List of (tile_x, tile_z) coordinates
+            max_workers: Maximum concurrent requests
+
+        Returns:
+            List of (tile_x, tile_z, geometry) tuples
+        """
+        results = []
+
+        def fetch_one(coords):
+            tx, tz = coords
+            geom = self.fetch_tile(map_id, tx, tz)
+            return (tx, tz, geom)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_one, c): c for c in tile_coords}
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    coords = futures[future]
+                    logging.debug(f"Tile {coords} failed: {e}")
+                    results.append((coords[0], coords[1], None))
+
+        return results
+
     def get_textures(self, map_id: str) -> TextureAtlas:
         """
-        Load textures for a map (cached).
+        Load textures for a map (cached both in memory and on disk).
 
         Args:
             map_id: Map identifier
@@ -130,12 +173,19 @@ class BlueMapClient:
         logging.info(f"Loading textures for map {map_id}...")
 
         try:
+            # Try to load from disk cache first (skips network request)
+            atlas = self._texture_loader.load_atlas_cached_only(map_id)
+            if atlas is not None:
+                self._texture_cache[map_id] = atlas
+                return atlas
+
+            # No cache, fetch from network
             url = self.base_url + Endpoints.TEXTURES.format(map_id=map_id)
             r = self.session.get(url)
             r.raise_for_status()
             textures_data = r.json()
 
-            atlas = self._texture_loader.load_atlas(textures_data)
+            atlas = self._texture_loader.load_atlas(textures_data, map_id=map_id)
             self._texture_cache[map_id] = atlas
             return atlas
 

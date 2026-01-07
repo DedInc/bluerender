@@ -4,6 +4,7 @@ CLI entry point for BlueMap 3D capture.
 """
 
 import argparse
+import time
 
 from bluerender import (
     BlueMap3DRenderer,
@@ -29,10 +30,13 @@ def main():
     args = parse_args()
     configure_logging(args.verbose)
 
+    total_start = time.perf_counter()
+
     renderer = BlueMap3DRenderer(args.url, use_gpu=not args.software)
 
     print_capture_info(args, renderer)
 
+    render_start = time.perf_counter()
     renderer.capture(
         map_id=args.map,
         center_x=args.x,
@@ -49,8 +53,22 @@ def main():
         perspective=not args.ortho,
         output_path=args.output,
     )
+    render_time = time.perf_counter() - render_start
+    total_time = time.perf_counter() - total_start
 
     print(f"Done! Saved to {args.output}")
+
+    if args.benchmark:
+        print("\n  Benchmark results:")
+        print(f"    Total time:  {total_time:.3f}s")
+        print(f"    Render time: {render_time:.3f}s")
+        if hasattr(renderer, "timing") and renderer.timing:
+            t = renderer.timing
+            print("    Breakdown:")
+            print(f"      - Tiles:    {t.get('tiles', 0) * 1000:.1f}ms")
+            print(f"      - Textures: {t.get('textures', 0) * 1000:.1f}ms")
+            print(f"      - Render:   {t.get('render', 0) * 1000:.1f}ms")
+            print(f"      - Save:     {t.get('save', 0) * 1000:.1f}ms")
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,6 +159,11 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Verbose output",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Show timing benchmarks",
     )
 
     return parser.parse_args()
