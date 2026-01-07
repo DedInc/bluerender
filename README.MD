@@ -21,7 +21,6 @@
 - **Multi-Tier Fallback** — Fast software → Standard software → Always works
 - **Parallel Tile Loading** — Efficient HTTP client with session caching
 - **Persistent Texture Cache** — Decoded textures cached to disk with smart invalidation
-- **Persistent Texture Cache** — Decoded textures cached to disk with smart invalidation
 
 ### 🎨 Accurate Visual Fidelity
 - **Authentic Textures** — Loads textures directly from BlueMap's `textures.json`
