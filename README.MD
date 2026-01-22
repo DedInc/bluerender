@@ -17,7 +17,7 @@ It supports OpenGL rendering via ModernGL with fallbacks to software rasterizati
 Clone the repository:
 
 ```bash
-git clone https://github.com/your-repo/bluerender.git
+git clone https://github.com/DedInc/bluerender.git
 cd bluerender
 ```
 
